@@ -1,4 +1,3 @@
-# pip install openai pypdf python-docx python-pptx openpyxl xlrd
 from __future__ import annotations
 
 from pathlib import Path
@@ -50,17 +49,19 @@ SUPPORTED_EXTENSIONS = {
 
 
 # ============================================================
-# PROMPT + JSON SCHEMA
+# PROMPT + SCHEMA
 # ============================================================
 
 PROMPT = """
 Ты парсер документов для RAG-базы.
 
 Я передам тебе текст, извлечённый из документа.
+
 В тексте могут быть технические маркеры:
 [PAGE 1]
 [PARAGRAPH 12]
 [STYLE Heading 1]
+[LIST]
 [SLIDE 3]
 [SHEET Sheet1]
 [ROW 15]
@@ -68,20 +69,25 @@ PROMPT = """
 
 Твоя задача — разбить документ на логические блоки.
 
-Жёсткие правила:
+Правила:
 1. Не пересказывай текст.
 2. Не добавляй ничего от себя.
 3. Не исправляй смысл.
 4. Сохраняй текст максимально дословно.
-5. Не добавляй технические маркеры [PAGE ...], [PARAGRAPH ...], [STYLE ...], [SLIDE ...], [SHEET ...], [ROW ...], [TABLE ...] в поле text.
-6. type должен быть одним из: title, heading, paragraph, list_item, table, slide_text, sheet_row, unknown.
-7. heading — текущий заголовок раздела или null.
-8. page — номер страницы PDF или null.
-9. paragraph — номер параграфа DOCX или null.
-10. slide — номер слайда PPTX или null.
-11. sheet — имя листа Excel или null.
-12. row — номер строки Excel или null.
-13. Верни только JSON по схеме.
+5. Не добавляй технические маркеры в поле text.
+6. Если видишь [LIST], почти всегда ставь type = "list_item".
+7. Не делай отдельный блок на каждую новую строку.
+8. Объединяй соседние строки, если они относятся к одному абзацу, таблице, слайду или смысловой секции.
+9. Для Excel строки одной таблицы объединяй в type = "table", если они относятся к одной таблице.
+10. type должен быть одним из:
+    title, heading, paragraph, list_item, table, slide_text, unknown.
+11. heading — текущий заголовок раздела или null.
+12. page — номер страницы PDF или null.
+13. paragraph — номер параграфа DOCX или null.
+14. slide — номер слайда PPTX или null.
+15. sheet — имя листа Excel или null.
+16. row — номер начальной строки Excel или null.
+17. Верни только JSON по схеме.
 """
 
 SCHEMA: dict[str, Any] = {
@@ -94,15 +100,9 @@ SCHEMA: dict[str, Any] = {
         "blocks",
     ],
     "properties": {
-        "document_title": {
-            "type": "string"
-        },
-        "document_type": {
-            "type": "string"
-        },
-        "language": {
-            "type": "string"
-        },
+        "document_title": {"type": "string"},
+        "document_type": {"type": "string"},
+        "language": {"type": "string"},
         "blocks": {
             "type": "array",
             "items": {
@@ -128,31 +128,16 @@ SCHEMA: dict[str, Any] = {
                             "list_item",
                             "table",
                             "slide_text",
-                            "sheet_row",
                             "unknown",
                         ],
                     },
-                    "heading": {
-                        "type": ["string", "null"]
-                    },
-                    "page": {
-                        "type": ["integer", "null"]
-                    },
-                    "paragraph": {
-                        "type": ["integer", "null"]
-                    },
-                    "slide": {
-                        "type": ["integer", "null"]
-                    },
-                    "sheet": {
-                        "type": ["string", "null"]
-                    },
-                    "row": {
-                        "type": ["integer", "null"]
-                    },
-                    "text": {
-                        "type": "string"
-                    },
+                    "heading": {"type": ["string", "null"]},
+                    "page": {"type": ["integer", "null"]},
+                    "paragraph": {"type": ["integer", "null"]},
+                    "slide": {"type": ["integer", "null"]},
+                    "sheet": {"type": ["string", "null"]},
+                    "row": {"type": ["integer", "null"]},
+                    "text": {"type": "string"},
                 },
             },
         },
@@ -164,8 +149,8 @@ SCHEMA: dict[str, Any] = {
 # TEXT HELPERS
 # ============================================================
 
-def clean_text(text: str) -> str:
-    text = str(text)
+def clean_text(value: Any) -> str:
+    text = "" if value is None else str(value)
     text = text.replace("\x00", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -188,12 +173,12 @@ def format_cell_value(value: Any) -> str:
     return clean_text(value)
 
 
-def looks_like_supported_file(path: Path) -> bool:
+def is_supported_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
 
 
 # ============================================================
-# PDF READER
+# PDF
 # ============================================================
 
 def read_pdf(path: Path) -> str:
@@ -201,8 +186,7 @@ def read_pdf(path: Path) -> str:
     parts: list[str] = []
 
     for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        text = clean_text(text)
+        text = clean_text(page.extract_text() or "")
 
         if text:
             parts.append(f"[PAGE {page_number}]\n{text}")
@@ -211,7 +195,7 @@ def read_pdf(path: Path) -> str:
 
 
 # ============================================================
-# DOCX READER
+# DOCX
 # ============================================================
 
 def iter_docx_blocks(document: DocxDocument):
@@ -222,6 +206,31 @@ def iter_docx_blocks(document: DocxDocument):
             yield Paragraph(child, document)
         elif child.tag.endswith("}tbl"):
             yield DocxTable(child, document)
+
+
+def get_docx_style_name(paragraph: Paragraph) -> str:
+    if paragraph.style is None:
+        return "Unknown"
+
+    return paragraph.style.name or "Unknown"
+
+
+def is_docx_list_paragraph(paragraph: Paragraph) -> bool:
+    p = paragraph._p
+    p_pr = p.pPr
+
+    if p_pr is not None and p_pr.numPr is not None:
+        return True
+
+    style_name = get_docx_style_name(paragraph).lower()
+
+    list_words = [
+        "list",
+        "список",
+        "перечень",
+    ]
+
+    return any(word in style_name for word in list_words)
 
 
 def read_docx_table(table: DocxTable) -> str:
@@ -253,13 +262,17 @@ def read_docx(path: Path) -> str:
             text = clean_text(block.text)
 
             if text:
-                style_name = block.style.name if block.style else "Unknown"
+                style_name = get_docx_style_name(block)
 
-                parts.append(
-                    f"[PARAGRAPH {paragraph_number}]\n"
-                    f"[STYLE {style_name}]\n"
-                    f"{text}"
-                )
+                markers = [
+                    f"[PARAGRAPH {paragraph_number}]",
+                    f"[STYLE {style_name}]",
+                ]
+
+                if is_docx_list_paragraph(block):
+                    markers.append("[LIST]")
+
+                parts.append("\n".join(markers) + "\n" + text)
 
             paragraph_number += 1
 
@@ -280,7 +293,7 @@ def read_docx(path: Path) -> str:
 
 
 # ============================================================
-# PPTX READER
+# PPTX
 # ============================================================
 
 def read_pptx_table(table: PptxTable) -> str:
@@ -304,7 +317,7 @@ def read_pptx(path: Path) -> str:
     presentation = Presentation(str(path))
     parts: list[str] = []
 
-    for slide_index, slide in enumerate(presentation.slides, start=1):
+    for slide_number, slide in enumerate(presentation.slides, start=1):
         slide_parts: list[str] = []
 
         for shape_index, shape in enumerate(slide.shapes, start=1):
@@ -313,7 +326,7 @@ def read_pptx(path: Path) -> str:
 
                 if table_text:
                     slide_parts.append(
-                        f"[SLIDE {slide_index}]\n"
+                        f"[SLIDE {slide_number}]\n"
                         f"[TABLE {shape_index}]\n"
                         f"{table_text}"
                     )
@@ -323,7 +336,7 @@ def read_pptx(path: Path) -> str:
 
                 if text:
                     slide_parts.append(
-                        f"[SLIDE {slide_index}]\n"
+                        f"[SLIDE {slide_number}]\n"
                         f"{text}"
                     )
 
@@ -334,7 +347,7 @@ def read_pptx(path: Path) -> str:
 
 
 # ============================================================
-# XLSX READER
+# XLSX
 # ============================================================
 
 def read_xlsx(path: Path) -> str:
@@ -358,8 +371,8 @@ def read_xlsx(path: Path) -> str:
             if not any(values):
                 continue
 
-            row_text = " | ".join(values)
             row_number = row[0].row if row else None
+            row_text = " | ".join(values)
 
             parts.append(
                 f"[SHEET {sheet_name}]\n"
@@ -373,7 +386,7 @@ def read_xlsx(path: Path) -> str:
 
 
 # ============================================================
-# XLS READER
+# XLS
 # ============================================================
 
 def read_xls(path: Path) -> str:
@@ -396,8 +409,8 @@ def read_xls(path: Path) -> str:
             if not any(values):
                 continue
 
-            row_text = " | ".join(values)
             row_number = row_index + 1
+            row_text = " | ".join(values)
 
             parts.append(
                 f"[SHEET {sheet_name}]\n"
@@ -409,7 +422,7 @@ def read_xls(path: Path) -> str:
 
 
 # ============================================================
-# DOCUMENT READER
+# READ DOCUMENT
 # ============================================================
 
 def read_document(path: Path) -> str:
@@ -434,12 +447,12 @@ def read_document(path: Path) -> str:
 
 
 def find_documents(input_dir: Path) -> list[Path]:
-    files = [path for path in input_dir.rglob("*") if looks_like_supported_file(path)]
+    files = [path for path in input_dir.rglob("*") if is_supported_file(path)]
     return sorted(files)
 
 
 # ============================================================
-# SPLIT BIG TEXT
+# SPLIT
 # ============================================================
 
 def split_text(text: str, max_chars: int) -> list[str]:
@@ -519,6 +532,7 @@ def build_empty_document(path: Path) -> dict[str, Any]:
     return {
         "source_file": str(path),
         "source_file_name": path.name,
+        "file_extension": path.suffix.lower(),
         "document_title": path.stem,
         "document_type": "unknown",
         "language": "unknown",

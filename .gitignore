@@ -1,0 +1,17 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# PyCharm/JetBrains files
+.idea/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/

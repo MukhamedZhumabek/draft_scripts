@@ -90,60 +90,32 @@ PROMPT = """
 17. Верни только JSON по схеме.
 """
 
-SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": [
-        "document_title",
-        "document_type",
-        "language",
-        "blocks",
-    ],
-    "properties": {
-        "document_title": {"type": "string"},
-        "document_type": {"type": "string"},
-        "language": {"type": "string"},
-        "blocks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": [
-                    "type",
-                    "heading",
-                    "page",
-                    "paragraph",
-                    "slide",
-                    "sheet",
-                    "row",
-                    "text",
-                ],
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": [
-                            "title",
-                            "heading",
-                            "paragraph",
-                            "list_item",
-                            "table",
-                            "slide_text",
-                            "unknown",
-                        ],
-                    },
-                    "heading": {"type": ["string", "null"]},
-                    "page": {"type": ["integer", "null"]},
-                    "paragraph": {"type": ["integer", "null"]},
-                    "slide": {"type": ["integer", "null"]},
-                    "sheet": {"type": ["string", "null"]},
-                    "row": {"type": ["integer", "null"]},
-                    "text": {"type": "string"},
-                },
-            },
-        },
-    },
-}
+JSON_OUTPUT_RULES = """
+Верни только валидный JSON object.
+Без markdown.
+Без ```json.
+Без комментариев.
 
+Формат ответа:
+
+{
+  "document_title": "string",
+  "document_type": "string",
+  "language": "string",
+  "blocks": [
+    {
+      "type": "title | heading | paragraph | list_item | table | slide_text | unknown",
+      "heading": "string or null",
+      "page": "integer or null",
+      "paragraph": "integer or null",
+      "slide": "integer or null",
+      "sheet": "string or null",
+      "row": "integer or null",
+      "text": "string"
+    }
+  ]
+}
+"""
 
 # ============================================================
 # TEXT HELPERS
@@ -501,27 +473,39 @@ def parse_part_with_llm(
     part_index: int,
     total_parts: int,
 ) -> dict[str, Any]:
-    response = client.responses.create(
-        model=MODEL,
-        instructions=PROMPT,
-        input=f"""
-FILE_NAME: {file_name}
-PART: {part_index}/{total_parts}
+    system_prompt = PROMPT + "\n\n" + JSON_OUTPUT_RULES
 
-TEXT:
-{text_part}
-""",
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "parsed_document",
-                "strict": True,
-                "schema": SCHEMA,
-            }
+    user_prompt = f"""
+    FILE_NAME: {file_name}
+    PART: {part_index}/{total_parts}
+    
+    TEXT:
+    {text_part}
+    """
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        response_format={
+            "type": "json_object",
         },
     )
 
-    return json.loads(response.output_text)
+    content = response.choices[0].message.content
+
+    if content is None:
+        raise RuntimeError("LLM returned empty response")
+
+    return json.loads(content)
 
 
 # ============================================================
